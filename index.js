@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+// const fs = require('fs');
 const PORT = process.env.PORT || 3010;
 const mariadb = require('mariadb');
 require('dotenv').config();
