@@ -1,9 +1,20 @@
 const express = require('express');
 const cors = require('cors');
-// const fs = require('fs');
+
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+
 const PORT = process.env.PORT || 3010;
 const mariadb = require('mariadb');
 require('dotenv').config();
+
+const options = {
+  key: fs.readFileSync(path.join('/etc/letsencrypt/live/xn--b1aahbbaz5a0afbu7i.su', 'privkey.pem')),
+  cert: fs.readFileSync(path.join('/etc/letsencrypt/live/xn--b1aahbbaz5a0afbu7i.su', 'fullchain.pem')),
+  // Опционально, добавьте цепочку сертификатов, если используется
+  // ca: fs.readFileSync('/path/to/chainfile.pem')
+};
 
 function getCurrentDateInYYMMDD() {
   const date = new Date();
@@ -151,6 +162,10 @@ app.get('/othernews', async (req, res) => {
 app.listen(PORT, () => 
 {
   console.log(`Сервер запущен на http://localhost:${PORT}`);
+});
+
+https.createServer(options, app).listen(443, () => {
+  console.log('HTTPS server running on port 443');
 });
 
 process.on('SIGINT', () => {
