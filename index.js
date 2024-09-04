@@ -37,6 +37,12 @@ let msgDate;
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*'); // Разрешает запросы с любого домена
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  next();
+});
+
 // app.use(bot.webhookCallback(`/bot${botToken}`)); // Используем webhookCallback для обработки обновлений
 
 const getConnection = async () => {
