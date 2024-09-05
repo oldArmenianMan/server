@@ -167,7 +167,7 @@ app.listen(PORT, () =>
 });
 
 https.createServer(options, app).listen(8443, () => {
-  console.log('HTTPS server running on port 443');
+  console.log('HTTPS server running on port 8443');
 });
 
 process.on('SIGINT', () => {
