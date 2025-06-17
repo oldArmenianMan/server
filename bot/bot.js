@@ -1,10 +1,134 @@
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
+const https = require('https');
+const { URL } = require('url');
+const fetch = require('node-fetch');
 
 require('dotenv').config({ path: '../.env' });
 const mariadb = require('mariadb');
 
 const botToken = process.env.BOT_TOKEN;
+const VK_GROUP_TOKEN = process.env.VK_TOKEN;
+const VK_GROUP_ID = process.env.VK_GROUP_ID;
+const APP_TOKEN = process.env.APP_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+
+async function postToVK(message, videoId) {
+  // Создаём URL с прикреплением видео
+  const url = `https://api.vk.com/method/wall.post?owner_id=-${VK_GROUP_ID}&message=${encodeURIComponent(message)}&attachments=video${videoId}&access_token=${VK_GROUP_TOKEN}&v=5.131`;
+  const response = await fetch(url);
+  const data = await response.json();
+
+  if (data.error) {
+    console.error('Ошибка отправки в VK по токену группы или подобному:', data.error);
+  } else {
+    console.log('Сообщение успешно отправлено в VK');
+  }
+}
+
+async function uploadVideoAndPost(message, videoFile, access_token) {
+  const uploadUrlResponse = await fetch(`https://api.vk.com/method/video.save?access_token=${access_token}&v=5.131`);
+  const uploadUrlData = await uploadUrlResponse.json();
+
+  if (uploadUrlData.error) {
+    console.error('Ошибка получения URL для загрузки видео:', uploadUrlData.error);
+    return;
+  }
+
+  const uploadUrl = uploadUrlData.response.upload_url;
+
+  const formData = new FormData();
+  formData.append('video_file', videoFile); // videoFile — это файл, который вы хотите загрузить
+
+  const uploadResponse = await fetch(uploadUrl, {
+    method: 'POST',
+    body: formData,
+  });
+  const uploadData = await uploadResponse.json();
+
+  if (uploadData.error) {
+    console.error('Ошибка загрузки видео:', uploadData.error);
+    return;
+  }
+
+  // Шаг 3: Получаем ID загруженного видео
+  const videoId = uploadData.video.id;
+
+  // Шаг 4: Отправляем пост с видео
+  await postToVK(message, videoId);
+}
+
+
+async function getRefreshedToken() {
+  let refresh_token = await getRefreshToken();
+  console.log ('Токен из базы данных (Refresh.refresh)', refresh_token.refresh_token);
+
+  const headers = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+  };
+  const body = {
+    'grant_type': 'refresh_token',
+    'refresh_token': refresh_token,
+    'client_id': CLIENT_ID,
+    'device_id': 'e7xmYgvJpCjCOX95ltA32OFeAUSbyI2E4qfx6zGdO6Dw2sAXizb7lahsWmM47H7y1TFycuyVUSNanKnBdJ2AeQ',
+    'state': ''
+  };
+  const url = 'https://id.vk.com/oauth2/auth';
+
+  axios.post(url, body, { headers })
+  .then(response => {
+    // console.log('Ответ сервера refresh_token:', response.data.refresh_token);
+    // console.log('Ответ сервера access_token:', response.data.access_token);
+    refresh_token = response.data.refresh_token;
+    let access_token = response.data.access_token;
+    let values = [access_token, refresh_token];
+    console.log('Значения переменных в values: ', values);
+    insertTokensInDataBase(values);
+  })
+  .catch(error => {
+    console.error('Ошибка:', error.response ? error.response.data : error.message);
+  });
+  
+}
+
+async function insertTokensInDataBase(values) {
+  const conn = await getConnection();
+      try {
+          await conn.query(`UPDATE tokens SET access_token = ?, refresh_token = ? WHERE id = 1;`, values);
+      } catch (err) {
+          console.error('Ошибка вставки данных:', err.message);
+      } finally {
+          conn.end();
+      }
+}
+
+async function getRefreshToken() {
+  const conn = await getConnection();
+  try {
+    let refresh_token = await conn.query('SELECT refresh_token FROM tokens WHERE id = 1');
+    console.log('Полученный рефреш токен из бд: ', refresh_token[0].refresh_token);
+    let result = refresh_token[0].refresh_token;
+    return result;
+  } catch (err) {
+      console.error('Ошибка получения рефреш токена:', err.message);
+  } finally {
+      conn.end();
+  }
+}
+
+async function getAccessToken() {
+  const conn = await getConnection();
+  try {
+    let access_token = await conn.query('SELECT access_token FROM tokens WHERE id = 1');
+    let result = access_token[0].access_token;
+    return result;
+  } catch (err) {
+      console.error('Ошибка получения аксес токена:', err.message);
+  } finally {
+      conn.end();
+  }
+}
+
 const bot = new Telegraf(botToken, {
   telegram: {
     apiRoot: 'http://localhost:8081'
@@ -16,7 +140,7 @@ const pool = mariadb.createPool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT, 1000)
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT, 10)
 });
 
 const getConnection = async () => {
@@ -29,6 +153,121 @@ const getConnection = async () => {
     throw err;
   }
 };
+
+// Получение сообщений из канала Telegram и отправка их в VK
+
+bot.on('channel_post', async (ctx) => {
+  const channelPost = ctx.update.channel_post;
+
+  let { messageDate, stringDate, userMessage, checkHashtag, 
+    messagePhoto, messageVideo, file_id, entities } = await extractMessageDetails(ctx, channelPost);
+  
+  getRefreshedToken();
+  let access_token = await getAccessToken();
+  if (userMessage && (userMessage !== 'Текст или описание отсутствуют')) {
+    await uploadVideoAndPost(userMessage, messageVideo, access_token);
+  }
+
+  if (await messageIsEmpty(userMessage)) {
+      console.log('Медиа файл не содержит текста, поэтому не публикуется');
+  } else {
+      // console.log(entities);
+      if (entities) {
+          userMessage = applyFormatting(userMessage, entities);
+      }
+      await insertDataBasedOnHashtag(checkHashtag, userMessage, messagePhoto, 
+        messageVideo, file_id, messageDate, stringDate);
+  }
+});
+
+async function extractMessageDetails(ctx, channelPost) {
+  let file_id, timestamp, stringDate, userMessage, messageDate, checkHashtag;
+  let messageVideo, messagePhoto;
+  let entities = channelPost.entities ? channelPost.entities : (channelPost.caption_entities ? channelPost.caption_entities : undefined);
+  
+  const isChannelPost = !ctx.message || typeof ctx.message !== 'object';
+
+  timestamp = isChannelPost ? channelPost.date : ctx.message.date;
+  messageDate = new Date(timestamp * 1000);
+  stringDate = formatDateToYYMMDD(messageDate);
+
+  userMessage = isChannelPost
+      ? (channelPost.text || channelPost.caption || 'Текст или описание отсутствуют')
+      : (channelPost.message.text || channelPost.message.caption || 'Текст или описание отсутствуют');
+      // console.log('userMessage внутри функции ', userMessage);
+  checkHashtag = extractHashtag(userMessage);
+  // console.log('chat id: ', channelPost.chat.id);
+
+  if (isChannelPost) {
+      ({ file_id, messageVideo, messagePhoto } = await getMediaLinks(channelPost, ctx));
+  } else {
+      ({ file_id, messageVideo, messagePhoto } = await getMediaLinks(ctx.message, ctx));
+  }
+  
+  return { messageDate, stringDate, userMessage, checkHashtag, messagePhoto, messageVideo, file_id, entities};
+}
+
+async function getMediaLinks(message, ctx) {
+  let file_id, messageVideo, messagePhoto;
+
+  if (message.video) {
+      const fileId = message.video.file_id;
+      file_id = fileId;
+      try {
+          messageVideo = await ctx.telegram.getFileLink(fileId);
+          // console.log('messageVideo is', messageVideo);
+      } catch (error) {
+          messageVideo = 'Error';
+          console.error('Error getting file link:', error);
+      }
+  } else {
+      console.log("Video not found");
+  }
+
+  if (message.photo) {
+      const fileId = message.photo[message.photo.length - 1].file_id;
+      file_id = fileId;
+      try {
+          messagePhoto = await ctx.telegram.getFileLink(fileId);
+      } catch (error) {
+          console.error('Error getting file link:', error);
+      }
+  } else {
+      console.log("Image not found");
+  }
+
+  return { file_id, messageVideo, messagePhoto };
+}
+
+async function insertDataBasedOnHashtag(checkHashtag, userMessage, messagePhoto, messageVideo, file_id, messageDate, stringDate) {
+  const insertData = async (table, values) => {
+      const conn = await getConnection();
+      try {
+          await conn.query(`INSERT INTO ${table} (text, linkP, linkV, file_id, date) VALUES (?, ?, ?, ?, ?)`, values);
+      } catch (err) {
+          console.error('Ошибка вставки данных:', err.message);
+      } finally {
+          conn.end();
+      }
+  };
+
+  switch (checkHashtag) {
+      case 'empty':
+      case '#бесстрашные':
+          await insertData('list', [formatMessage(userMessage), messagePhoto, messageVideo, file_id, messageDate]);
+          break;
+      case '#вызывайволгу':
+          await insertData('volga', [formatMessage(userMessage), messagePhoto, messageVideo, file_id, messageDate]);
+          break;
+      case '#этот_день_в_истории':
+      case '#Этот_день_в_истории':
+          await insertData('history', [formatMessage(userMessage), messagePhoto, messageVideo, file_id, stringDate]);
+          break;
+      default:
+          console.log('not value');
+  }
+}
+
 
 function formatMessage(message) {
   const regExp = /\*|▪️|🇷🇺|#этот_день_в_истории|#Этот_день_в_истории|#вызывайволгу|#бесстрашные|#Бесстрашные|Северный Ветер|🏳️‍🌈|🏳️‍⚧️|🇺🇳|🇦🇫|🇦🇽|🇦🇱|🇩🇿|🇦🇸|🇦🇩|🇦🇴|🇦🇮|🇦🇶|🇦🇬|🇦🇷|🇦🇲|🇦🇼|🇦🇺|🇦🇹🇦🇿🇧🇸🇧🇭🇧🇩🇧🇧🇧🇾🇧🇪🇧🇿|🇧🇯|🇧🇲|🇧🇹|🇧🇴|🇧🇦|🇧🇼|🇧🇷|🇻🇬|🇧🇳|🇧🇬|🇧🇫|🇧🇮|🇰🇭|🇨🇲|🇨🇦|🇮🇨|🇨🇻|🇧🇶|🇰🇾|🇨🇫|🇹🇩|🇮🇴|🇨🇱|🇨🇳|🇨🇽|🇨🇨|🇨🇴|🇰🇲|🇨🇬|🇨🇩|🇨🇰|🇨🇷|🇨🇮|🇭🇷|🇨🇺|🇨🇼|🇨🇾|🇨🇿|🇩🇰|🇩🇯|🇩🇲|🇩🇴|🇪🇨|🇪🇬|🇸🇻|🇬🇶|🇪🇷|🇪🇪|🇸🇿|🇪🇹|🇪🇺|🇫🇰|🇫🇴|🇫🇯|🇫🇮|🇫🇷|🇬🇫|🇵🇫|🇹🇫|🇬🇦|🇬🇲|🇬🇪|🇩🇪|🇬🇭|🇬🇮|🇬🇷|🇬🇱|🇬🇩|🇬🇵|🇬🇺|🇬🇹|🇬🇬|🇬🇳|🇬🇼|🇬🇾|🇭🇹|🇭🇳|🇭🇰|🇭🇺|🇮🇸|🇮🇳|🇮🇩|🇮🇷|🇮🇶|🇮🇪|🇮🇲|🇮🇱|🇮🇹|🇯🇲|🇯🇵|🎌|🇯🇪|🇯🇴|🇰🇿|🇰🇪|🇰🇮|🇽🇰|🇰🇼|🇰🇬|🇱🇦|🇱🇻|🇱🇧|🇱🇸|🇱🇷|🇱🇾|🇱🇮|🇱🇹|🇱🇺|🇲🇴|🇲🇬|🇲🇼|🇲🇾|🇲🇻|🇲🇱|🇲🇹|🇲🇭|🇲🇶|🇲🇷|🇲🇺|🇾🇹|🇲🇽|🇫🇲|🇲🇩|🇲🇨|🇲🇳|🇲🇪|🇲🇸|🇲🇦|🇲🇿|🇲🇲|🇳🇦|🇳🇷|🇳🇵|🇳🇱|🇳🇨|🇳🇿|🇳🇮|🇳🇪|🇳🇬|🇳🇺|🇳🇫|🇰🇵|🇲🇰|🇲🇵|🇳🇴|🇴🇲|🇵🇰|🇵🇼|🇵🇸|🇵🇦|🇵🇬|🇵🇾|🇵🇪|🇵🇭|🇵🇳|🇵🇱|🇵🇹|🇵🇷|🇶🇦|🇷🇪|🇷🇴|🇷🇺|🇷🇼|🇼🇸|🇸🇲|🇸🇹|🇸🇦|🇸🇳|🇷🇸|🇸🇨|🇸🇱|🇸🇬|🇸🇽|🇸🇰|🇸🇮|🇬🇸|🇸🇧|🇸🇴|🇿🇦|🇰🇷|🇸🇸|🇪🇸|🇱🇰|🇧🇱|🇸🇭|🇰🇳|🇱🇨|🇵🇲|🇻🇨|🇸🇩|🇸🇷|🇸🇪|🇨🇭|🇸🇾|🇹🇼|🇹🇯|🇹🇿|🇹🇭|🇹🇱|🇹🇬|🇹🇰|🇹🇴|🇹🇹|🇹🇳|🇹🇷|🇹🇲|🇹🇨|🇹🇻|🇺🇬|🇺🇦|🇦🇪|🇬🇧|🏴󠁧󠁢󠁥󠁮󠁧󠁿|🏴󠁧󠁢󠁳󠁣󠁴󠁿|🏴󠁧󠁢󠁷󠁬󠁳󠁿|🇺🇸|🇺🇾|🇻🇮|🇺🇿|🇻🇺|🇻🇦|🇻🇪|🇻🇳|🇼🇫|🇪🇭|🇾🇪|🇿🇲|🇿🇼/g;
@@ -44,7 +283,7 @@ function extractHashtag(message) {
       return 'empty';
     }
   }
-function messageIsEmpty(message)
+async function messageIsEmpty(message)
 {
   const regExp = /Текст или описание отсутствуют/;
   const match = message.match(regExp);
@@ -55,7 +294,6 @@ function messageIsEmpty(message)
     return false
   }
 }
-
 function formatDateToYYMMDD(isoDate) {
   const date = new Date(isoDate);
   const year = date.getFullYear().toString().slice(-2);
@@ -63,262 +301,52 @@ function formatDateToYYMMDD(isoDate) {
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
-
-function applyFormatting(text, entitiesT)
-{
-  let substr;
-  let styleType;
-  let formatText = '';
-  let freeString;
-  let memorySubstr;
-  let entities;
-  if (entitiesT[0] === 'object')
-  {
-    entities = entitiesT[0];
-  }
-  else {entities=entitiesT}
+function applyFormatting(text, entitiesT) {
+  let entities = Array.isArray(entitiesT) && entitiesT[0]?.type ? entitiesT : entitiesT[0];
   entities.sort((a, b) => a.offset - b.offset);
-  for (let i = 0; i < entities.length; i++)
-  {
-    if ((entities[i].offset == 0) && (i == 0) )
-    {
-      substr = text.substring(entities[i].offset, entities[i].offset + entities[i].length);
-      styleType = entities[i].type;
-      substr = addStyle(substr, styleType);
-      formatText += substr;
-      memorySubstr = substr;
-    }
-    
-    else if ((entities[i].offset > 0) && (i == 0))
-    {
-      styleType = entities[i].type;
-      freeString = text.substring(0, entities[i].offset - 1);
-      formatText += freeString;
-      substr = text.substring(entities[i].offset, entities[i].offset + entities[i].length);
-      substr = addStyle(substr, styleType);
-      formatText += substr;
-      memorySubstr = substr;
-    }
-    else if (entities[i].offset == entities[i - 1].offset)
-      {
-        styleType = entities[i].type;
-        formatText = formatText.replace(memorySubstr, '');
-        substr = addStyle(memorySubstr, styleType);
-        memorySubstr = substr;
-        formatText += substr;
-      }
-    else if ((entities[i].offset > 0) && (i > 0))
-    {
-      if ((entities[i].offset - (entities[i - 1].offset + entities[i - 1].length)) > 1)
-      {
-        freeString = text.substring((entities[i - 1].offset + entities[i - 1].length), entities[i].offset);
-        formatText += freeString;
-      }
-      substr = text.substring(entities[i].offset, entities[i].offset + entities[i].length);
-      styleType = entities[i].type;
-      substr = addStyle(substr, styleType);
-      memorySubstr = substr;
-      formatText += substr;
-    }
-  }
-  function addStyle (substr, styleType)
-  {
-    switch (styleType) {
-      case 'bold': 
-        substr = '<strong>' + substr + '</strong>';
-        break;
-      case 'italic':
-        substr = '<em>' + substr +'</em>';
-        break;
-      case 'underline':
-        substr = '<u>' + substr +'</u>';
-        break;
-      case 'strikethrough':
-        substr = '<s>' + substr + '</s>';
-        break;
-      case 'blockquote':
-        substr = '<blockquote>' + substr + '</blockquote>';
-        break;
-      case 'mention':
-        substr = '<a href="#">' + substr + '</a>'; 
-        break;
-      default:
-        substr = substr; 
-    }
-    return substr;
-  }
-  return formatText.replace(/\n/g, '<br>')
-}
 
-const checkLink = async (bot) => {
-  const conn = await getConnection();
-  try {
-    const filesLink = await conn.query('SELECT file_id, linkP FROM list WHERE file_id IS NOT NULL');
-    for (const link of filesLink) {
-      try {
-        const newLink = await bot.telegram.getFileLink(link.file_id);
-        const response = await fetch(newLink);
-        if (response.status === 404) {
-          await conn.query('UPDATE list SET linkP = ? WHERE file_id = ?', [newLink, link.file_id]);
-        }
-      } catch (error) {
-        console.error(`Error fetching or updating link for file_id ${link.file_id}:`, error)
+  let formatText = '';
+  let memorySubstr = '';
+
+  for (let i = 0; i < entities.length; i++) {
+      const { offset, length, type } = entities[i];
+      const substr = text.substring(offset, offset + length);
+
+      if (i === 0) {
+          if (offset === 0) {
+              formatText += addStyle(substr, type);
+          } else {
+              formatText += text.substring(0, offset) + addStyle(substr, type);
+          }
+      } else {
+          if (offset === entities[i - 1].offset) {
+              formatText = formatText.replace(memorySubstr, addStyle(memorySubstr, type));
+          } else {
+              if (offset > entities[i - 1].offset + entities[i - 1].length) {
+                  formatText += text.substring(entities[i - 1].offset + entities[i - 1].length, offset);
+              }
+              formatText += addStyle(substr, type);
+          }
       }
-    }
-  } catch (error) {
-    console.error('Error querying the database:', error);
-  } finally {
-    conn.end();
+      memorySubstr = substr; // обновляем память с последним подстрокой
+  }
+
+  return formatText.replace(/\n/g, '<br>');
+}
+function addStyle(substr, styleType) {
+  switch (styleType) {
+      case 'bold': return `<strong>${substr}</strong>`;
+      case 'italic': return `<em>${substr}</em>`;
+      case 'underline': return `<u>${substr}</u>`;
+      case 'strikethrough': return `<s>${substr}</s>`;
+      case 'blockquote': return `<blockquote>${substr}</blockquote>`;
+      case 'mention': return `<a href="#">${substr}</a>`;
+      default: return substr;
   }
 }
-
-
-bot.on('channel_post', async (ctx) => {
-  let file_id;
-  let timestamp;
-  let stringDate;
-  let userMessage;
-  let messageDate;
-  let checkHashtag;
-  let messageVideo;
-  let messagePhoto;
-  let entities = undefined;
-  const channelPost = ctx.update.channel_post;
-
-  if (!ctx.message || typeof ctx.message !== 'object') {
-    console.error('Отсутствует message:', ctx.message);
-    timestamp = channelPost.date;
-    entities = channelPost.entities ? channelPost.entities : (channelPost.caption_entities ? channelPost.caption_entities : undefined);
-    messageDate = new Date(timestamp * 1000);
-    stringDate = formatDateToYYMMDD(messageDate);
-    userMessage = ctx.text ? ctx.text : (ctx.caption ? ctx.caption : 'Текст или описание отсутствуют');
-    checkHashtag = extractHashtag(userMessage);
-    console.log("Тестовое сообщение",userMessage);
-    console.log('chat id: ', channelPost.chat.id);
-    
-    if (channelPost.video) {
-      const fileId =  await channelPost.video.file_id;
-      file_id = fileId;
-      try {
-        messageVideo = await ctx.telegram.getFileLink(fileId);
-        console.log('messageVideo is', messageVideo);
-      } catch (error) {
-        messageVideo = 'Error';
-        console.error('Error getting file link:', error);
-      }
-    } else {console.log("Video not found")};
-
-    if (channelPost.photo) {
-      const fileId = await channelPost.photo[channelPost.photo.length - 1].file_id;
-      file_id = fileId;
-      try {
-        messagePhoto = await ctx.telegram.getFileLink(fileId);
-      } catch (error) {
-        console.error('Error getting file link:', error);
-      }
-    } else {console.log("Image not found")};
-  } else 
-  {
-      timestamp = ctx.message.date;
-      messageDate = new Date(timestamp * 1000);
-      stringDate = formatDateToYYMMDD(messageDate);
-      entities = ctx.message.entities ? ctx.message.entities : (ctx.message.caption_entities ? ctx.message.caption_entities : undefined);
-      userMessage = ctx.message.text ? ctx.message.text : (ctx.message.caption ? ctx.message.caption : 'Текст или описание отсутствуют');
-      checkHashtag = extractHashtag(userMessage);
-    if (ctx.message.video) {
-      const fileId = ctx.message.video.file_id;
-      file_id = fileId;
-      try {
-        messageVideo = ctx.telegram.getFileLink(fileId);
-      } catch (error) {
-        console.error('Error getting file link:', error);
-      }
-    } else {console.log("Video not found")};
-
-    if (ctx.message.photo) {
-      const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-      file_id = fileId;
-      try {
-        messagePhoto = ctx.telegram.getFileLink(fileId);
-      } catch (error) {
-        console.error('Error getting file link:', error);
-      }
-    } else {console.log("Image not found")};
-  }
-
-  console.log('Channel_Post is ', channelPost);
-  if (messageIsEmpty(userMessage))
-  {
-    console.log(userMessage)
-    console.log('Медиа файл не содержит текста, поэтому не публикуется');
-  } 
-  else {
-    console.log(entities);
-    if (entities != undefined)
-    {
-      userMessage = applyFormatting(userMessage, entities);
-    };
-    switch (checkHashtag) {
-        case 'empty':
-              const conn = await getConnection();
-              try {
-                await conn.query('INSERT INTO list (text, linkP, linkV, file_id, date) VALUES (?, ?, ?, ?, ?)', [formatMessage(userMessage), messagePhoto, messageVideo, file_id, messageDate]);
-              } catch (err) {
-                console.error('Ошибка вставки данных:', err.message);
-              } finally {
-                conn.end();
-              }          
-          break;
-        case '#вызывайволгу':
-          const conn2 = await getConnection();
-          try {
-            await conn2.query('INSERT INTO volga (text, linkP, linkV, file_id, date) VALUES (?, ?, ?, ?, ?)', [formatMessage(userMessage), messagePhoto, messageVideo, file_id, messageDate]);
-          } catch (err) {
-            console.error('Ошибка вставки данных:', err.message);
-          } finally {
-            conn2.end();
-          }
-          break;
-        case '#этот_день_в_истории':
-          const conn3 = await getConnection();
-          try {
-            await conn3.query('INSERT INTO history (text, linkP, date, file_id) VALUES (?, ?, ?, ?)', [formatMessage(userMessage), messagePhoto, stringDate, file_id]);
-          } catch (err) {
-            console.error('Ошибка вставки данных:', err.message);
-          } finally {
-            conn3.end();
-          }
-          break;
-        case '#Этот_день_в_истории':
-          const conn4 = await getConnection();
-          try {
-            await conn4.query('INSERT INTO history (text, linkP, date, file_id) VALUES (?, ?, ?, ?)', [formatMessage(userMessage), messagePhoto, stringDate, file_id]);
-          } catch (err) {
-            console.error('Ошибка вставки данных:', err.message);
-          } finally {
-            conn4.end();
-          }
-          break;
-          case '#бесстрашные':
-                const conn5 = await getConnection();
-                try {
-                  await conn5.query('INSERT INTO list (text, linkP, linkV, file_id, date) VALUES (?, ?, ?, ?, ?)', [formatMessage(userMessage), messagePhoto, messageVideo, file_id, messageDate]);
-                } catch (err) {
-                  console.error('Ошибка вставки данных:', err.message);
-                } finally {
-                  conn5.end();
-                }
-              
-          break;
-        default:
-          console.log('not value');
-      }
-  }
-  // checkLink(bot);  
-});
 
 bot.launch().then(() => {
-  console.log('Бот успешно запущен через polling');
+  // console.log('Бот успешно запущен через polling');
 }).catch((err) => {
   console.error('Ошибка запуска бота:', err);
 });

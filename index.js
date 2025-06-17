@@ -30,8 +30,6 @@ const pool = mariadb.createPool({
   connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT, 10)
 });
 
-let messages = [];
-let msgDate;
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -48,60 +46,6 @@ const getConnection = async () => {
     throw err;
   }
 };
-
-
-app.post('/volga', async (req, res) => {
-  const { messages: newMessages } = req.body;
-  const conn = await getConnection();
-
-  try {
-    await conn.query('INSERT INTO volga (textlinkP, linkV) VALUES (?, ?, ?)', [newMessages, req.body.photoUrl, req.body,videoUrl]);
-    messages.unshift(newMessages); // оптимизировать!!!
-    console.log(messages);
-    res.json({ messages: newMessages });
-  } catch (err) {
-    console.error('Ошибка вставки данных:', err.message);
-    res.status(500).json({success: false, error: 'Ошибка вставки данных'});
-  } finally {
-    conn.end();
-  }
-});
-
-app.post('/messages', async (req, res) => 
-{
-  const { messages: newMessages } = req.body;
-  const conn = await getConnection();
-
-  try {
-    await conn.query('INSERT INTO list (text, linkP, linkV) VALUES (?, ?, ?)', [newMessages, req.body.photoUrl, req.body,videoUrl]);
-    messages.unshift(newMessages); // оптимизировать!!!
-    console.log(messages);
-    res.json({ messages: newMessages });
-  } catch (err) {
-    console.error('Ошибка вставки данных:', err.message);
-    res.status(500).json({success: false, error: 'Ошибка вставки данных'});
-  } finally {
-    conn.end();
-  }
-});
-
-app.post('/history', async (req, res) => 
-  {
-    const { messages: newMessages } = req.body;
-    const conn = await getConnection();
-  
-    try {
-      await conn.query('INSERT INTO history (text, date, linkP) VALUES (?, ?, ?)', [newMessages, req.body.msgDate, req.body.photoUrl]);
-      messages.unshift(newMessages); // оптимизировать!!!
-      console.log(messages);
-      res.json({ messages: newMessages });
-    } catch (err) {
-      console.error('Ошибка вставки данных:', err.message);
-      res.status(500).json({success: false, error: 'Ошибка вставки данных'});
-    } finally {
-      conn.end();
-    }
-  });
 
 app.get('/messages', async (req, res) => {
   const conn = await getConnection();
@@ -149,11 +93,12 @@ app.get('/history', async (req, res) => {
   const conn = await getConnection();
 
   try {
-    const [text, photo] = await Promise.all([
+    const [text, photo, date] = await Promise.all([
       conn.query('SELECT text FROM history ORDER BY id DESC'),
       conn.query('SELECT linkP FROM history ORDER BY id DESC'),
+      conn.query('SELECT date FROM history ORDER BY id DESC'),
     ]);
-    const resp = [text, photo]
+    const resp = [text, photo, date]
     res.json(resp);
   } catch (err) {
     console.error('Ошибка получения данных:', err.message);
